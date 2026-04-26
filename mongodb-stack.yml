@@ -15,7 +15,7 @@ Parameters:
     Description: EKS control plane version
   TaskySecretKey:
     Type: String
-    Default: 'tasky'
+    Default: 'changeme-secret-key-please'
     NoEcho: true
     Description: SECRET_KEY env var for Tasky JWT signing
 
@@ -499,10 +499,17 @@ Resources:
         Type: NO_SOURCE
         BuildSpec: |
           version: 0.2
+          env:
+            variables:
+              DOCKER_BUILDKIT: "0"
           phases:
             pre_build:
               commands:
                 - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO_URI
+                # Anonymous token for ghcr.io public pulls (avoids shared-IP rate limits)
+                - TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:jeffthorne/tasky:pull" | sed -E 's/.*"token":"([^"]+)".*/\1/')
+                - echo $TOKEN | docker login ghcr.io -u USERNAME --password-stdin
+                - docker pull $SOURCE_IMAGE
             build:
               commands:
                 - mkdir build && cd build
