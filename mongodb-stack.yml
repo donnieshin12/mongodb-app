@@ -15,7 +15,7 @@ Parameters:
     Description: EKS control plane version
   TaskySecretKey:
     Type: String
-    Default: 'changeme-secret-key-please'
+    Default: 'tasky'
     NoEcho: true
     Description: SECRET_KEY env var for Tasky JWT signing
 
@@ -493,23 +493,29 @@ Resources:
             Value: !GetAtt TaskyECRRepo.RepositoryUri
           - Name: AWS_REGION
             Value: !Ref AWS::Region
-          - Name: TASKY_REPO
-            Value: https://github.com/jeffthorne/tasky.git
+          - Name: SOURCE_IMAGE
+            Value: ghcr.io/jeffthorne/tasky:latest
       Source:
         Type: NO_SOURCE
         BuildSpec: |
           version: 0.2
+          env:
+            variables:
+              DOCKER_BUILDKIT: "0"
           phases:
             pre_build:
               commands:
                 - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO_URI
-                - git clone --depth 1 $TASKY_REPO /tmp/tasky
+                - docker pull $SOURCE_IMAGE
             build:
               commands:
-                - cd /tmp/tasky
+                - mkdir build && cd build
                 - echo "Donnie" > wizexercise.txt
-                # Append the file copy to the existing Dockerfile's release stage
-                - echo "COPY wizexercise.txt /app/wizexercise.txt" >> Dockerfile
+                - |
+                  cat > Dockerfile <<EOF
+                  FROM $SOURCE_IMAGE
+                  COPY wizexercise.txt /app/wizexercise.txt
+                  EOF
                 - docker build -t $ECR_REPO_URI:latest .
             post_build:
               commands:
