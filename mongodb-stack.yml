@@ -15,7 +15,7 @@ Parameters:
     Description: EKS control plane version
   TaskySecretKey:
     Type: String
-    Default: 'tasky'
+    Default: 'changeme-secret-key-please'
     NoEcho: true
     Description: SECRET_KEY env var for Tasky JWT signing
 
@@ -379,14 +379,29 @@ Resources:
         - Key: Name
           Value: !Sub '${AWS::StackName}-eks-cluster-sg'
 
+  # Pre-create the EKS control plane log group with 1-day retention.
+  # EKS would auto-create it on first write, but then we can't control retention.
+  EKSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${AWS::StackName}-cluster/cluster'
+      RetentionInDays: 1
+
   EKSCluster:
     Type: AWS::EKS::Cluster
+    DependsOn: EKSLogGroup
     Properties:
       Name: !Sub '${AWS::StackName}-cluster'
       Version: !Ref KubernetesVersion
       RoleArn: !GetAtt EKSClusterRole.Arn
       AccessConfig:
         AuthenticationMode: API_AND_CONFIG_MAP
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: audit
+            - Type: api
+            - Type: authenticator
       ResourcesVpcConfig:
         SubnetIds:
           - !Ref PrivateSubnet1
@@ -475,6 +490,10 @@ Resources:
                   - ecr:BatchGetImage
                   - ecr:GetDownloadUrlForLayer
                 Resource: !GetAtt TaskyECRRepo.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: arn:aws:s3:::tasky-source-dshin/tasky-main.zip
 
   TaskyImageBuild:
     Type: AWS::CodeBuild::Project
@@ -493,8 +512,8 @@ Resources:
             Value: !GetAtt TaskyECRRepo.RepositoryUri
           - Name: AWS_REGION
             Value: !Ref AWS::Region
-          - Name: TASKY_REPO
-            Value: https://github.com/jeffthorne/tasky.git
+          - Name: SOURCE_S3
+            Value: s3://tasky-source-dshin/tasky-main.zip
       Source:
         Type: NO_SOURCE
         BuildSpec: |
@@ -503,12 +522,16 @@ Resources:
             pre_build:
               commands:
                 - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO_URI
-                - git clone --depth 1 $TASKY_REPO /tmp/tasky
+                - aws s3 cp $SOURCE_S3 /tmp/tasky.zip
+                - unzip -q /tmp/tasky.zip -d /tmp
+                # Find the extracted directory (handles both tasky-main/ and tasky/ layouts)
+                - SRC=$(find /tmp -maxdepth 2 -name Dockerfile -type f | head -1 | xargs dirname)
+                - echo "Source dir is $SRC"
+                - echo "$SRC" > /tmp/srcdir
             build:
               commands:
-                - cd /tmp/tasky
+                - cd $(cat /tmp/srcdir)
                 - echo "Donnie" > wizexercise.txt
-                # Append the file copy to the existing Dockerfile's release stage
                 - echo "COPY wizexercise.txt /app/wizexercise.txt" >> Dockerfile
                 - docker build -t $ECR_REPO_URI:latest .
             post_build:
@@ -516,6 +539,107 @@ Resources:
                 - docker push $ECR_REPO_URI:latest
       TimeoutInMinutes: 15
 
+  # Step Functions (Standard) builds the image and signals CFN directly.
+  # No Lambda timeout because SFN .sync handles long builds, and the state
+  # machine itself sends the CFN response when the build finishes.
+  ImageBuildStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-image-build-sm-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: run-codebuild-and-callback
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:BatchGetReports
+                Resource: !GetAtt TaskyImageBuild.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForCodeBuildStartBuildRule'
+
+  ImageBuildStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-image-build'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt ImageBuildStateMachineRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Build Tasky image and report success/failure to CloudFormation",
+          "StartAt": "BuildImage",
+          "States": {
+            "BuildImage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${TaskyImageBuild}"
+              },
+              "ResultPath": "$.BuildResult",
+              "Next": "ReportSuccess",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.Error",
+                  "Next": "ReportFailure"
+                }
+              ]
+            },
+            "ReportSuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::http:invoke",
+              "Parameters": {
+                "ApiEndpoint.$": "$.ResponseURL",
+                "Method": "PUT",
+                "RequestBody": {
+                  "Status": "SUCCESS",
+                  "Reason": "Image built successfully",
+                  "PhysicalResourceId.$": "$.LogicalResourceId",
+                  "StackId.$": "$.StackId",
+                  "RequestId.$": "$.RequestId",
+                  "LogicalResourceId.$": "$.LogicalResourceId",
+                  "Data": {}
+                }
+              },
+              "End": true
+            },
+            "ReportFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::http:invoke",
+              "Parameters": {
+                "ApiEndpoint.$": "$.ResponseURL",
+                "Method": "PUT",
+                "RequestBody": {
+                  "Status": "FAILED",
+                  "Reason.$": "$.Error.Cause",
+                  "PhysicalResourceId.$": "$.LogicalResourceId",
+                  "StackId.$": "$.StackId",
+                  "RequestId.$": "$.RequestId",
+                  "LogicalResourceId.$": "$.LogicalResourceId",
+                  "Data": {}
+                }
+              },
+              "End": true
+            }
+          }
+        }
+
+  # Tiny Lambda whose only job is to start the state machine and return.
+  # No polling, no timeout risk — SFN does the waiting and signals CFN.
   ImageBuildLambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -530,36 +654,33 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: trigger-codebuild
+        - PolicyName: start-state-machine
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action:
-                  - codebuild:StartBuild
-                  - codebuild:BatchGetBuilds
-                Resource: !GetAtt TaskyImageBuild.Arn
+                Action: states:StartExecution
+                Resource: !Ref ImageBuildStateMachine
 
   ImageBuildLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${AWS::StackName}-image-rebuild'
+      FunctionName: !Sub '${AWS::StackName}-image-rebuild-starter'
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt ImageBuildLambdaRole.Arn
-      Timeout: 900
+      Timeout: 30
       Code:
         ZipFile: |
           import os
-          import time
           import json
           import urllib.request
           import boto3
 
-          codebuild = boto3.client('codebuild')
-          PROJECT = os.environ['CODEBUILD_PROJECT']
+          sfn = boto3.client('stepfunctions')
+          STATE_MACHINE = os.environ['STATE_MACHINE_ARN']
 
-          def send(event, context, status, data=None, reason=None):
+          def send(event, context, status, reason=None):
               body = json.dumps({
                   'Status': status,
                   'Reason': reason or f'See CloudWatch log: {context.log_stream_name}',
@@ -567,7 +688,7 @@ Resources:
                   'StackId': event['StackId'],
                   'RequestId': event['RequestId'],
                   'LogicalResourceId': event['LogicalResourceId'],
-                  'Data': data or {},
+                  'Data': {},
               }).encode('utf-8')
               req = urllib.request.Request(
                   event['ResponseURL'], data=body, method='PUT',
@@ -575,31 +696,30 @@ Resources:
               urllib.request.urlopen(req)
 
           def handler(event, context):
+              # Delete: nothing to clean up, signal success immediately.
+              if event['RequestType'] == 'Delete':
+                  send(event, context, 'SUCCESS')
+                  return
+
               try:
-                  if event['RequestType'] == 'Delete':
-                      send(event, context, 'SUCCESS')
-                      return
-
-                  # Pull tasky:latest from ghcr.io, append wizexercise.txt, push to ECR.
-                  build = codebuild.start_build(projectName=PROJECT)
-                  build_id = build['build']['id']
-
-                  # Wait for completion (Lambda timeout is 15min, build is ~2-3min)
-                  while True:
-                      time.sleep(15)
-                      resp = codebuild.batch_get_builds(ids=[build_id])
-                      status = resp['builds'][0]['buildStatus']
-                      if status == 'SUCCEEDED':
-                          send(event, context, 'SUCCESS', {'BuildId': build_id})
-                          return
-                      if status in ('FAILED', 'FAULT', 'STOPPED', 'TIMED_OUT'):
-                          send(event, context, 'FAILED', reason=f'Build {status}: {build_id}')
-                          return
+                  # Start the state machine, passing the CFN response URL + IDs
+                  # so the SFN can call back when the build finishes.
+                  sfn_input = {
+                      'ResponseURL': event['ResponseURL'],
+                      'StackId': event['StackId'],
+                      'RequestId': event['RequestId'],
+                      'LogicalResourceId': event['LogicalResourceId'],
+                  }
+                  sfn.start_execution(
+                      stateMachineArn=STATE_MACHINE,
+                      input=json.dumps(sfn_input),
+                  )
+                  # Lambda exits here; CFN keeps waiting until the SFN calls back.
               except Exception as e:
                   send(event, context, 'FAILED', reason=str(e))
       Environment:
         Variables:
-          CODEBUILD_PROJECT: !Ref TaskyImageBuild
+          STATE_MACHINE_ARN: !Ref ImageBuildStateMachine
 
   # Custom resource fires on stack create to actually build the image
   TaskyImageBuildTrigger:
@@ -819,6 +939,253 @@ Resources:
           Id: TaskyDeployBuild
           RoleArn: !GetAtt EventBridgeInvokeRole.Arn
 
+  # ============== S3 source upload → rebuild trigger ==============
+  # Bucket must have EventBridge notifications enabled (one-time, manual):
+  #   aws s3api put-bucket-notification-configuration \
+  #     --bucket tasky-source-dshin \
+  #     --notification-configuration '{"EventBridgeConfiguration":{}}'
+  S3UploadInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-s3-upload-eb-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-rebuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt TaskyImageBuild.Arn
+
+  S3UploadRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-source-uploaded'
+      Description: Rebuild Tasky image when source zip is updated
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - tasky-source-dshin
+          object:
+            key:
+              - tasky-main.zip
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TaskyImageBuild.Arn
+          Id: TaskyImageBuild
+          RoleArn: !GetAtt S3UploadInvokeRole.Arn
+
+  # ============== Enable EventBridge notifications on the source bucket ==============
+  # The bucket exists outside this stack, so we can't manage it natively.
+  # This Lambda flips the EventBridge notification flag once on create.
+  EnableS3EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-enable-s3-eb-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: configure-bucket-notifications
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                Resource: arn:aws:s3:::tasky-source-dshin
+
+  EnableS3EventBridgeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-enable-s3-eb'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt EnableS3EventBridgeRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+
+          s3 = boto3.client('s3')
+          BUCKET = 'tasky-source-dshin'
+
+          def send(event, context, status, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See log: {context.log_stream_name}',
+                  'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': {},
+              }).encode('utf-8')
+              req = urllib.request.Request(
+                  event['ResponseURL'], data=body, method='PUT',
+                  headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # Read current config, strip EventBridge, put back.
+                      cfg = s3.get_bucket_notification_configuration(Bucket=BUCKET)
+                      cfg.pop('EventBridgeConfiguration', None)
+                      cfg.pop('ResponseMetadata', None)
+                      s3.put_bucket_notification_configuration(
+                          Bucket=BUCKET,
+                          NotificationConfiguration=cfg,
+                      )
+                      send(event, context, 'SUCCESS')
+                      return
+
+                  # Preserve any existing notifications, just add EventBridge.
+                  cfg = s3.get_bucket_notification_configuration(Bucket=BUCKET)
+                  cfg.pop('ResponseMetadata', None)
+                  cfg['EventBridgeConfiguration'] = {}
+                  s3.put_bucket_notification_configuration(
+                      Bucket=BUCKET,
+                      NotificationConfiguration=cfg,
+                  )
+                  send(event, context, 'SUCCESS')
+              except Exception as e:
+                  send(event, context, 'FAILED', reason=str(e))
+
+  EnableS3EventBridge:
+    Type: Custom::EnableS3EventBridge
+    Properties:
+      ServiceToken: !GetAtt EnableS3EventBridgeLambda.Arn
+
+  # ============== ECR enhanced scanning (Inspector v2) ==============
+  # Two pieces:
+  #   1. AWS::ECR::RegistryScanningConfiguration — declarative, native CFN.
+  #   2. Tiny Lambda for inspector2:Enable, since CFN has no resource for it.
+
+  # Native: switch the registry to ENHANCED with continuous scanning.
+  ECRRegistryScanningConfig:
+    Type: AWS::ECR::RegistryScanningConfiguration
+    DependsOn: EnableInspector
+    Properties:
+      ScanType: ENHANCED
+      Rules:
+        - ScanFrequency: CONTINUOUS_SCAN
+          RepositoryFilters:
+            - Filter: '*'
+              FilterType: WILDCARD
+
+  # Service-linked role policy for Inspector to read ECR.
+  ECRRegistryPolicy:
+    Type: AWS::ECR::RegistryPolicy
+    DeletionPolicy: Retain
+    Properties:
+      PolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowInspectorScan
+            Effect: Allow
+            Principal:
+              Service: inspector2.amazonaws.com
+            Action:
+              - ecr:BatchGetRepositoryScanningConfiguration
+              - ecr:DescribeRepositories
+              - ecr:DescribeImages
+              - ecr:DescribeImageScanFindings
+            Resource: '*'
+
+  # Tiny Lambda for the one thing CFN can't do: enable Inspector v2 for the account.
+  EnableInspectorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-enable-inspector-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: enable-inspector
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - inspector2:Enable
+                  - inspector2:BatchGetAccountStatus
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+
+  EnableInspectorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-enable-inspector'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt EnableInspectorLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+
+          inspector = boto3.client('inspector2')
+
+          def send(event, context, status, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See log: {context.log_stream_name}',
+                  'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': {},
+              }).encode('utf-8')
+              req = urllib.request.Request(
+                  event['ResponseURL'], data=body, method='PUT',
+                  headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # Don't disable on stack delete — other stacks may rely on it
+                      send(event, context, 'SUCCESS')
+                      return
+                  inspector.enable(resourceTypes=['ECR'])
+                  send(event, context, 'SUCCESS')
+              except Exception as e:
+                  send(event, context, 'FAILED', reason=str(e))
+
+  EnableInspector:
+    Type: Custom::EnableInspector
+    Properties:
+      ServiceToken: !GetAtt EnableInspectorLambda.Arn
+
 Outputs:
   MongoPublicIP:
     Description: Public IP of MongoDB host
@@ -839,6 +1206,9 @@ Outputs:
       > ${AWS::StackName}-mongo-key.pem && chmod 400 ${AWS::StackName}-mongo-key.pem
   EKSClusterName:
     Value: !Ref EKSCluster
+  EKSAuditLogGroup:
+    Description: CloudWatch Logs group for EKS control plane logs (audit, api, authenticator)
+    Value: !Sub '/aws/eks/${EKSCluster}/cluster'
   KubeconfigCommand:
     Description: Command to update kubeconfig
     Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${EKSCluster}'
@@ -851,6 +1221,11 @@ Outputs:
   DeployPipelineProject:
     Description: CodeBuild project that auto-deploys on ECR push
     Value: !Ref TaskyDeployBuild
+  ViewScanFindingsCommand:
+    Description: View enhanced scan findings for a tasky image
+    Value: !Sub >
+      aws inspector2 list-findings --filter-criteria
+      '{"ecrImageRepositoryName":[{"comparison":"EQUALS","value":"${TaskyECRRepo}"}]}'
   BackupBucketName:
     Description: PUBLIC S3 bucket holding daily mongodump archives
     Value: !Ref BackupBucket
