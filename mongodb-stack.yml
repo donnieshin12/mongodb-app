@@ -571,6 +571,32 @@ Resources:
                   - events:PutRule
                   - events:DescribeRule
                 Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForCodeBuildStartBuildRule'
+              - Effect: Allow
+                Action:
+                  - states:InvokeHTTPEndpoint
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-image-build'
+              - Effect: Allow
+                Action:
+                  - events:RetrieveConnectionCredentials
+                Resource: !GetAtt CFNCallbackConnection.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:events!connection/*'
+
+  # EventBridge Connection required by Step Functions http:invoke.
+  # CFN response URLs don't need auth, but the integration requires a
+  # connection ARN regardless. We use a dummy API key.
+  CFNCallbackConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Name: !Sub '${AWS::StackName}-cfn-callback'
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: x-unused
+          ApiKeyValue: unused
 
   ImageBuildStateMachine:
     Type: AWS::StepFunctions::StateMachine
@@ -605,6 +631,9 @@ Resources:
               "Parameters": {
                 "ApiEndpoint.$": "$.ResponseURL",
                 "Method": "PUT",
+                "Authentication": {
+                  "ConnectionArn": "${CFNCallbackConnection.Arn}"
+                },
                 "RequestBody": {
                   "Status": "SUCCESS",
                   "Reason": "Image built successfully",
@@ -623,6 +652,9 @@ Resources:
               "Parameters": {
                 "ApiEndpoint.$": "$.ResponseURL",
                 "Method": "PUT",
+                "Authentication": {
+                  "ConnectionArn": "${CFNCallbackConnection.Arn}"
+                },
                 "RequestBody": {
                   "Status": "FAILED",
                   "Reason.$": "$.Error.Cause",
@@ -1078,84 +1110,12 @@ Resources:
       ServiceToken: !GetAtt EnableS3EventBridgeLambda.Arn
 
   # ============== ECR enhanced scanning (Inspector v2) ==============
-  # Registry scanning config and Inspector enable are managed outside this stack
-  # (the registry config is a per-account singleton; another stack or a manual
-  # CLI call already set it up). To verify or change it manually:
+  # Both the registry scanning config and Inspector activation are managed
+  # outside this stack (account-singletons set up via CLI / Organizations).
+  # To verify or change them manually:
   #   aws ecr get-registry-scanning-configuration
   #   aws inspector2 batch-get-account-status --account-ids <account>
-
-  # Tiny Lambda for the one thing CFN can't do: enable Inspector v2 for the account.
-  EnableInspectorLambdaRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${AWS::StackName}-enable-inspector-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: enable-inspector
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - inspector2:Enable
-                  - inspector2:BatchGetAccountStatus
-                  - iam:CreateServiceLinkedRole
-                Resource: '*'
-
-  EnableInspectorLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${AWS::StackName}-enable-inspector'
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt EnableInspectorLambdaRole.Arn
-      Timeout: 60
-      Code:
-        ZipFile: |
-          import json
-          import urllib.request
-          import boto3
-
-          inspector = boto3.client('inspector2')
-
-          def send(event, context, status, reason=None):
-              body = json.dumps({
-                  'Status': status,
-                  'Reason': reason or f'See log: {context.log_stream_name}',
-                  'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
-                  'StackId': event['StackId'],
-                  'RequestId': event['RequestId'],
-                  'LogicalResourceId': event['LogicalResourceId'],
-                  'Data': {},
-              }).encode('utf-8')
-              req = urllib.request.Request(
-                  event['ResponseURL'], data=body, method='PUT',
-                  headers={'content-type': '', 'content-length': str(len(body))})
-              urllib.request.urlopen(req)
-
-          def handler(event, context):
-              try:
-                  if event['RequestType'] == 'Delete':
-                      # Don't disable on stack delete — other stacks may rely on it
-                      send(event, context, 'SUCCESS')
-                      return
-                  inspector.enable(resourceTypes=['ECR'])
-                  send(event, context, 'SUCCESS')
-              except Exception as e:
-                  send(event, context, 'FAILED', reason=str(e))
-
-  EnableInspector:
-    Type: Custom::EnableInspector
-    Properties:
-      ServiceToken: !GetAtt EnableInspectorLambda.Arn
+  #   aws inspector2 enable --resource-types ECR
 
 Outputs:
   MongoPublicIP:
