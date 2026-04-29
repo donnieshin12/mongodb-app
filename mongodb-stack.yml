@@ -1078,40 +1078,11 @@ Resources:
       ServiceToken: !GetAtt EnableS3EventBridgeLambda.Arn
 
   # ============== ECR enhanced scanning (Inspector v2) ==============
-  # Two pieces:
-  #   1. AWS::ECR::RegistryScanningConfiguration — declarative, native CFN.
-  #   2. Tiny Lambda for inspector2:Enable, since CFN has no resource for it.
-
-  # Native: switch the registry to ENHANCED with continuous scanning.
-  ECRRegistryScanningConfig:
-    Type: AWS::ECR::RegistryScanningConfiguration
-    DependsOn: EnableInspector
-    Properties:
-      ScanType: ENHANCED
-      Rules:
-        - ScanFrequency: CONTINUOUS_SCAN
-          RepositoryFilters:
-            - Filter: '*'
-              FilterType: WILDCARD
-
-  # Service-linked role policy for Inspector to read ECR.
-  ECRRegistryPolicy:
-    Type: AWS::ECR::RegistryPolicy
-    DeletionPolicy: Retain
-    Properties:
-      PolicyText:
-        Version: '2012-10-17'
-        Statement:
-          - Sid: AllowInspectorScan
-            Effect: Allow
-            Principal:
-              Service: inspector2.amazonaws.com
-            Action:
-              - ecr:BatchGetRepositoryScanningConfiguration
-              - ecr:DescribeRepositories
-              - ecr:DescribeImages
-              - ecr:DescribeImageScanFindings
-            Resource: '*'
+  # Registry scanning config and Inspector enable are managed outside this stack
+  # (the registry config is a per-account singleton; another stack or a manual
+  # CLI call already set it up). To verify or change it manually:
+  #   aws ecr get-registry-scanning-configuration
+  #   aws inspector2 batch-get-account-status --account-ids <account>
 
   # Tiny Lambda for the one thing CFN can't do: enable Inspector v2 for the account.
   EnableInspectorLambdaRole:
