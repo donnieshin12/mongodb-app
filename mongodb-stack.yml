@@ -570,7 +570,9 @@ Resources:
                   - events:PutTargets
                   - events:PutRule
                   - events:DescribeRule
-                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForCodeBuildStartBuildRule'
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                Resource: '*'
               - Effect: Allow
                 Action:
                   - states:InvokeHTTPEndpoint
@@ -600,6 +602,7 @@ Resources:
 
   ImageBuildStateMachine:
     Type: AWS::StepFunctions::StateMachine
+    DependsOn: ImageBuildStateMachineRole
     Properties:
       StateMachineName: !Sub '${AWS::StackName}-image-build'
       StateMachineType: STANDARD
