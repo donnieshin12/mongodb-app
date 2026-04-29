@@ -523,7 +523,11 @@ Resources:
               commands:
                 - cd $(cat /tmp/srcdir)
                 - echo "Donnie" > wizexercise.txt
+                # Avoid Docker Hub rate limit: rewrite FROM lines to ECR Public.
+                - sed -i 's|FROM golang|FROM public.ecr.aws/docker/library/golang|g' Dockerfile
+                - sed -i 's|FROM alpine|FROM public.ecr.aws/docker/library/alpine|g' Dockerfile
                 - echo "COPY wizexercise.txt /app/wizexercise.txt" >> Dockerfile
+                - cat Dockerfile
                 - docker build -t $ECR_REPO_URI:latest .
             post_build:
               commands:
@@ -567,31 +571,55 @@ Resources:
                   - events:RemoveTargets
                 Resource: '*'
               - Effect: Allow
-                Action:
-                  - states:InvokeHTTPEndpoint
-                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-image-build'
-              - Effect: Allow
-                Action:
-                  - events:RetrieveConnectionCredentials
-                Resource: !GetAtt CFNCallbackConnection.Arn
-              - Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                  - secretsmanager:DescribeSecret
-                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:events!connection/*'
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CFNCallbackLambda.Arn
 
-  # EventBridge Connection required by Step Functions http:invoke.
-  # CFN response URLs don't need auth, but the integration requires a
-  # connection ARN regardless. We use a dummy API key.
-  CFNCallbackConnection:
-    Type: AWS::Events::Connection
+  # Tiny Lambda that sends the CFN callback HTTP PUT.
+  # Step Functions http:invoke struggles with CFN's pre-signed S3 response URLs,
+  # so we use a Lambda task instead.
+  CFNCallbackLambdaRole:
+    Type: AWS::IAM::Role
     Properties:
-      Name: !Sub '${AWS::StackName}-cfn-callback'
-      AuthorizationType: API_KEY
-      AuthParameters:
-        ApiKeyAuthParameters:
-          ApiKeyName: x-unused
-          ApiKeyValue: unused
+      RoleName: !Sub '${AWS::StackName}-cfn-callback-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  CFNCallbackLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-cfn-callback'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CFNCallbackLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+
+          def handler(event, context):
+              # Event comes from Step Functions with the CFN response fields.
+              body = json.dumps({
+                  'Status': event['Status'],
+                  'Reason': event.get('Reason', 'See log'),
+                  'PhysicalResourceId': event['LogicalResourceId'],
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': event.get('Data', {}),
+              }).encode('utf-8')
+              req = urllib.request.Request(
+                  event['ResponseURL'], data=body, method='PUT',
+                  headers={'content-type': '', 'content-length': str(len(body))})
+              with urllib.request.urlopen(req) as resp:
+                  return {'status_code': resp.status}
 
   ImageBuildStateMachine:
     Type: AWS::StepFunctions::StateMachine
@@ -622,42 +650,32 @@ Resources:
             },
             "ReportSuccess": {
               "Type": "Task",
-              "Resource": "arn:aws:states:::http:invoke",
+              "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "ApiEndpoint.$": "$.ResponseURL",
-                "Method": "PUT",
-                "Authentication": {
-                  "ConnectionArn": "${CFNCallbackConnection.Arn}"
-                },
-                "RequestBody": {
+                "FunctionName": "${CFNCallbackLambda.Arn}",
+                "Payload": {
                   "Status": "SUCCESS",
                   "Reason": "Image built successfully",
-                  "PhysicalResourceId.$": "$.LogicalResourceId",
+                  "ResponseURL.$": "$.ResponseURL",
                   "StackId.$": "$.StackId",
                   "RequestId.$": "$.RequestId",
-                  "LogicalResourceId.$": "$.LogicalResourceId",
-                  "Data": {}
+                  "LogicalResourceId.$": "$.LogicalResourceId"
                 }
               },
               "End": true
             },
             "ReportFailure": {
               "Type": "Task",
-              "Resource": "arn:aws:states:::http:invoke",
+              "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "ApiEndpoint.$": "$.ResponseURL",
-                "Method": "PUT",
-                "Authentication": {
-                  "ConnectionArn": "${CFNCallbackConnection.Arn}"
-                },
-                "RequestBody": {
+                "FunctionName": "${CFNCallbackLambda.Arn}",
+                "Payload": {
                   "Status": "FAILED",
                   "Reason.$": "$.Error.Cause",
-                  "PhysicalResourceId.$": "$.LogicalResourceId",
+                  "ResponseURL.$": "$.ResponseURL",
                   "StackId.$": "$.StackId",
                   "RequestId.$": "$.RequestId",
-                  "LogicalResourceId.$": "$.LogicalResourceId",
-                  "Data": {}
+                  "LogicalResourceId.$": "$.LogicalResourceId"
                 }
               },
               "End": true
