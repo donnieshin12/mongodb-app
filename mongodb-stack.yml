@@ -379,17 +379,8 @@ Resources:
         - Key: Name
           Value: !Sub '${AWS::StackName}-eks-cluster-sg'
 
-  # Pre-create the EKS control plane log group with 1-day retention.
-  # EKS would auto-create it on first write, but then we can't control retention.
-  EKSLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/eks/${AWS::StackName}-cluster/cluster'
-      RetentionInDays: 1
-
   EKSCluster:
     Type: AWS::EKS::Cluster
-    DependsOn: EKSLogGroup
     Properties:
       Name: !Sub '${AWS::StackName}-cluster'
       Version: !Ref KubernetesVersion
@@ -553,6 +544,8 @@ Resources:
             Principal:
               Service: states.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchEventsFullAccess
       Policies:
         - PolicyName: run-codebuild-and-callback
           PolicyDocument:
@@ -602,7 +595,6 @@ Resources:
 
   ImageBuildStateMachine:
     Type: AWS::StepFunctions::StateMachine
-    DependsOn: ImageBuildStateMachineRole
     Properties:
       StateMachineName: !Sub '${AWS::StackName}-image-build'
       StateMachineType: STANDARD
