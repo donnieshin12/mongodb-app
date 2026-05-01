@@ -673,6 +673,22 @@ Resources:
         ScanOnPush: true
       EmptyOnDelete: true
 
+  # Stores Trivy scan reports written by the image-build pipeline (private).
+  ScanReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-scan-reports-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-scan-reports
+            Status: Enabled
+            ExpirationInDays: 90
+
   ImageBuildRole:
     Type: AWS::IAM::Role
     Properties:
@@ -713,6 +729,10 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource: arn:aws:s3:::tasky-source-dshin/tasky-main.zip
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${ScanReportsBucket.Arn}/*'
 
   TaskyImageBuild:
     Type: AWS::CodeBuild::Project
@@ -733,6 +753,8 @@ Resources:
             Value: !Ref AWS::Region
           - Name: SOURCE_S3
             Value: s3://tasky-source-dshin/tasky-main.zip
+          - Name: SCAN_REPORTS_BUCKET
+            Value: !Ref ScanReportsBucket
       Source:
         Type: NO_SOURCE
         BuildSpec: |
@@ -757,6 +779,14 @@ Resources:
                 - echo "COPY wizexercise.txt /app/wizexercise.txt" >> Dockerfile
                 - cat Dockerfile
                 - docker build -t $ECR_REPO_URI:latest .
+                # ---------- Trivy image scan (warn-only) ----------
+                - echo "=== Trivy container image scan ==="
+                - curl -sLO https://github.com/aquasecurity/trivy/releases/download/v0.50.0/trivy_0.50.0_Linux-64bit.tar.gz
+                - tar xzf trivy_0.50.0_Linux-64bit.tar.gz
+                - ./trivy image --severity CRITICAL,HIGH --no-progress --exit-code 0 $ECR_REPO_URI:latest || true
+                - ./trivy image --format json --output /tmp/trivy-report.json --severity CRITICAL,HIGH,MEDIUM --exit-code 0 $ECR_REPO_URI:latest || true
+                - aws s3 cp /tmp/trivy-report.json s3://$SCAN_REPORTS_BUCKET/$(date +%Y%m%d-%H%M%S)-trivy.json || true
+                - echo "=== Scan complete (warn-only mode, build continues) ==="
             post_build:
               commands:
                 - docker push $ECR_REPO_URI:latest
